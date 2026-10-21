@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.feuerwerkagent.mapper.KbDocumentMapper">
+
+    <select id="selectAllDocuments" resultType="com.example.feuerwerkagent.entity.KbDocument">
+        SELECT id, file_name as fileName, file_relative_path as fileRelativePath,
+               file_size as fileSize, file_type as fileType, status, fail_msg as failMsg,
+               create_time as createTime, update_time as updateTime
+        FROM kb_document
+        ORDER BY create_time DESC
+    </select>
+
+    <insert id="insert" parameterType="com.example.feuerwerkagent.entity.KbDocument">
+        INSERT INTO kb_document (id, file_name, file_relative_path, file_size, file_type, status, fail_msg, create_time, update_time)
+        VALUES (#{id}, #{fileName}, #{fileRelativePath}, #{fileSize}, #{fileType}, #{status}, #{failMsg}, #{createTime}, #{updateTime})
+    </insert>
+
+    <update id="updateById" parameterType="com.example.feuerwerkagent.entity.KbDocument">
+        UPDATE kb_document
+        <set>
+            <if test="fileName != null">file_name = #{fileName},</if>
+            <if test="fileRelativePath != null">file_relative_path = #{fileRelativePath},</if>
+            <if test="fileSize != null">file_size = #{fileSize},</if>
+            <if test="fileType != null">file_type = #{fileType},</if>
+            <if test="status != null">status = #{status},</if>
+            <if test="failMsg != null">fail_msg = #{failMsg},</if>
+            <if test="updateTime != null">update_time = #{updateTime},</if>
+        </set>
+        WHERE id = #{id}
+    </update>
+
+    <select id="selectById" parameterType="long" resultType="com.example.feuerwerkagent.entity.KbDocument">
+        SELECT id, file_name as fileName, file_relative_path as fileRelativePath,
+               file_size as fileSize, file_type as fileType, status, fail_msg as failMsg,
+               create_time as createTime, update_time as updateTime
+        FROM kb_document
+        WHERE id = #{id}
+    </select>
+
+    <delete id="deleteById" parameterType="long">
+        DELETE FROM kb_document WHERE id = #{id}
+    </delete>
+
+</mapper>

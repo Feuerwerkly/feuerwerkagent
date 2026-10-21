@@ -1,0 +1,356 @@
+# =============================================================================
+# feuerwerkagent 全套 K8s 清单（k3s 单节点）
+# 学习要点：Namespace / Secret / ConfigMap / Deployment / StatefulSet /
+#           Service(3种类型) / PVC / Ingress / 探针 / 资源限制
+# 常用命令：
+#   kubectl -n feuerwerk get all,pvc,ingress        # 看全局状态
+#   kubectl -n feuerwerk logs -f deploy/feuerwerk-app  # 看后端日志
+#   kubectl -n feuerwerk rollout restart deploy/feuerwerk-app  # 滚动重启
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: feuerwerk
+
+---
+# ---------- Secret：敏感信息（密码）。比明文 env 规范 ----------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: feuerwerk-secrets
+  namespace: feuerwerk
+stringData:
+  MYSQL_ROOT_PASSWORD: "root"
+
+---
+# ---------- MySQL 8.0 ----------
+# 有状态服务这里用 Deployment + PVC 演示（单副本无冲突）；
+# 更规范的做法是 StatefulSet（见文末 ZooKeeper）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feuerwerk-mysql
+  namespace: feuerwerk
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: feuerwerk-mysql }
+  template:
+    metadata:
+      labels: { app: feuerwerk-mysql }
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom: { secretKeyRef: { name: feuerwerk-secrets, key: MYSQL_ROOT_PASSWORD } }
+        - name: MYSQL_DATABASE        # 首次启动自动建库
+          value: kb_db
+        # 建表 SQL 由 ConfigMap 挂进初始化目录，只在数据目录为空时执行一次
+        - name: TZ
+          value: Asia/Shanghai
+        args:
+        - --innodb-buffer-pool-size=128M   # 2G 小机器压缩内存占用
+        - --character-set-server=utf8mb4
+        - --collation-server=utf8mb4_unicode_ci
+        ports:
+        - containerPort: 3306
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+        - name: init-sql
+          mountPath: /docker-entrypoint-initdb.d
+        resources:
+          requests: { memory: 200Mi, cpu: 100m }
+          limits:   { memory: 512Mi }
+        readinessProbe:            # 就绪探针：没就绪就不接流量
+          exec:
+            command: ["sh", "-c", "mysqladmin ping -uroot -p$MYSQL_ROOT_PASSWORD --silent"]
+          initialDelaySeconds: 20
+          periodSeconds: 5
+      volumes:
+      - name: data
+        persistentVolumeClaim: { claimName: mysql-data }
+      - name: init-sql
+        configMap: { name: mysql-init-sql }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim          # 持久存储：k3s 默认 local-path 存储类
+metadata:
+  name: mysql-data
+  namespace: feuerwerk
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service                        # ClusterIP：集群内部访问（无对外端口）
+metadata:
+  name: feuerwerk-mysql
+  namespace: feuerwerk
+spec:
+  selector: { app: feuerwerk-mysql }
+  ports:
+  - port: 3306
+    targetPort: 3306
+
+---
+# ---------- Qdrant 向量数据库 ----------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feuerwerk-qdrant
+  namespace: feuerwerk
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: feuerwerk-qdrant }
+  template:
+    metadata:
+      labels: { app: feuerwerk-qdrant }
+    spec:
+      containers:
+      - name: qdrant
+        image: qdrant/qdrant:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 6333   # REST
+        - containerPort: 6334   # gRPC
+        volumeMounts:
+        - name: storage
+          mountPath: /qdrant/storage
+        resources:
+          requests: { memory: 64Mi }
+          limits:   { memory: 256Mi }
+      volumes:
+      - name: storage
+        persistentVolumeClaim: { claimName: qdrant-data }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qdrant-data
+  namespace: feuerwerk
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service                        # LoadBalancer：k3s 的 servicelb 直接把宿主机 6333 映射出来
+metadata:
+  name: feuerwerk-qdrant
+  namespace: feuerwerk
+spec:
+  type: LoadBalancer
+  selector: { app: feuerwerk-qdrant }
+  ports:
+  - port: 6333
+    targetPort: 6333
+
+---
+# ---------- Spring Boot 后端 ----------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feuerwerk-app
+  namespace: feuerwerk
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: feuerwerk-app }
+  template:
+    metadata:
+      labels: { app: feuerwerk-app }
+    spec:
+      initContainers:
+      # 启动顺序控制：等 MySQL 3306 可连了再启动主容器
+      # （K8s 不会自动保证跨 Deployment 的启动顺序，这是标准做法）
+      - name: wait-for-mysql
+        image: feuerwerk/app:1.0.4
+        imagePullPolicy: Never
+        command: ["bash", "-c", "until (echo > /dev/tcp/feuerwerk-mysql/3306) 2>/dev/null; do echo 'waiting for mysql...'; sleep 2; done"]
+      containers:
+      - name: app
+        image: feuerwerk/app:1.0.4
+        imagePullPolicy: Never          # 镜像是 ctr import 进本地的，禁止尝试拉取
+        env:
+        # 覆盖 application.yaml：MySQL/Qdrant 地址改成集群内 Service DNS 名
+        # （k8s 内任意 Pod 可用 <service-name>.<namespace>.svc.cluster.local 解析）
+        - name: SPRING_DATASOURCE_URL
+          value: "jdbc:mysql://feuerwerk-mysql:3306/kb_db?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai"
+        - name: SPRING_DATASOURCE_USERNAME
+          value: root
+        - name: SPRING_DATASOURCE_PASSWORD
+          valueFrom: { secretKeyRef: { name: feuerwerk-secrets, key: MYSQL_ROOT_PASSWORD } }
+        - name: QDRANT_HOST
+          value: feuerwerk-qdrant
+        - name: QDRANT_PORT
+          value: "6333"
+        - name: TZ
+          value: Asia/Shanghai
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet: { path: /api/ai/health, port: 8080 }
+          initialDelaySeconds: 25
+          periodSeconds: 5
+        livenessProbe:                  # 存活探针：失败会重启容器
+          httpGet: { path: /api/ai/health, port: 8080 }
+          initialDelaySeconds: 90
+          periodSeconds: 10
+        resources:
+          requests: { memory: 256Mi, cpu: 100m }
+          limits:   { memory: 768Mi }
+---
+apiVersion: v1
+kind: Service                        # LoadBalancer：宿主机 8080 直连后端（测试/SSE 调试用）
+metadata:
+  name: feuerwerk-app
+  namespace: feuerwerk
+spec:
+  type: LoadBalancer
+  selector: { app: feuerwerk-app }
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# ---------- 前端 Nginx（纯静态） ----------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feuerwerk-frontend
+  namespace: feuerwerk
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: feuerwerk-frontend }
+  template:
+    metadata:
+      labels: { app: feuerwerk-frontend }
+    spec:
+      containers:
+      - name: frontend
+        image: feuerwerk/frontend:1.0.2
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 80
+        resources:
+          requests: { memory: 16Mi }
+          limits:   { memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: feuerwerk-frontend
+  namespace: feuerwerk
+spec:
+  selector: { app: feuerwerk-frontend }
+  ports:
+  - port: 80
+    targetPort: 80
+
+---
+# ---------- Ingress：七层路由，统一从 80 端口进 ----------
+# / 和 /shop-images、/api 分流：前两者目标不同，按路径转发给不同 Service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: feuerwerk-ingress
+  namespace: feuerwerk
+spec:
+  ingressClassName: traefik
+  # HTTPS：视频通话的getUserMedia要求安全上下文（证书为自签，浏览器需点一次"继续访问"）
+  tls:
+  - hosts:
+    - 111.230.142.110
+    secretName: feuerwerk-tls
+  rules:
+  - http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend: { service: { name: feuerwerk-app, port: { number: 8080 } } }
+      - path: /shop-images
+        pathType: Prefix
+        backend: { service: { name: feuerwerk-app, port: { number: 8080 } } }
+      # IM即时通讯 WebSocket（Traefik 原生透传 Upgrade 头，无需额外注解）
+      - path: /ws
+        pathType: Prefix
+        backend: { service: { name: feuerwerk-app, port: { number: 8080 } } }
+      - path: /
+        pathType: Prefix
+        backend: { service: { name: feuerwerk-frontend, port: { number: 80 } } }
+
+---
+# ---------- ZooKeeper（学习组件，当前项目暂未使用） ----------
+# K8s 本身用 etcd，不需要 ZK；ZK 是 Kafka/Dubbo 生态的协调器。
+# 这里用 StatefulSet 部署单机模式，给后续学 Kafka/Dubbo 留环境。
+# StatefulSet vs Deployment：稳定网络名(zk-0)、稳定存储、有序启停。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zk
+  namespace: feuerwerk
+spec:
+  serviceName: zk-headless          # 配套 headless service：DNS 直达 Pod
+  replicas: 1
+  selector:
+    matchLabels: { app: zk }
+  template:
+    metadata:
+      labels: { app: zk }
+    spec:
+      containers:
+      - name: zookeeper
+        image: zookeeper:3.8
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: ZOO_MY_ID            # 单机模式 id=1；集群模式各节点不同
+          value: "1"
+        # 注：ZOO_4LW_COMMANDS 不会被镜像 entrypoint 写进 zoo.cfg（只认固定变量清单），
+        # 所以探针改用默认就启用的 srvr 命令
+        - name: JVMFLAGS             # 小内存
+          value: "-Xmx128m -Xms64m"
+        ports:
+        - containerPort: 2181        # 客户端端口
+        - containerPort: 2888        # 集群内选举/同步（单机用不到）
+        - containerPort: 3888
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: datalog
+          mountPath: /datalog
+        readinessProbe:
+          exec:                       # srvr 四字命令默认启用，返回含 Mode 字段即健康
+            command: ["sh", "-c", "echo srvr | nc 127.0.0.1 2181 | grep -q Mode"]
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        resources:
+          requests: { memory: 96Mi }
+          limits:   { memory: 256Mi }
+  volumeClaimTemplates:              # StatefulSet 专属：每个 Pod 自动配一块专属 PVC
+  - metadata: { name: data }
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: { requests: { storage: 2Gi } }
+  - metadata: { name: datalog }
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: { requests: { storage: 2Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zk-headless
+  namespace: feuerwerk
+spec:
+  clusterIP: None                    # headless：DNS 直接解析到 Pod IP
+  selector: { app: zk }
+  ports:
+  - { name: client,  port: 2181, targetPort: 2181 }
+  - { name: quorum,  port: 2888, targetPort: 2888 }
+  - { name: election, port: 3888, targetPort: 3888 }
+
